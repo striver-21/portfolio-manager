@@ -1,0 +1,36 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: portfolio-manager-db
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: portfolio_manager
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build: .
+    container_name: portfolio-manager-api
+    ports:
+      - "8080:8080"
+    environment:
+      DATABASE_URL: "host=postgres user=postgres password=postgres dbname=portfolio_manager port=5432 sslmode=disable"
+      PORT: "8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    expose:
+      - "8080"
+
+volumes:
+  postgres_data:
