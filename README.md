@@ -1,277 +1,207 @@
 # Portfolio Manager API
 
-A production-grade Go REST API for managing investment portfolios. Built with Gin framework, PostgreSQL, and JWT authentication.
-
-## Features
-
-- **User Management**: Secure registration and login with JWT tokens
-- **Portfolio Management**: Create and manage multiple investment portfolios
-- **Asset Tracking**: Add, update, and delete assets in portfolios
-- **Performance Analytics**: Calculate portfolio performance metrics (gains, returns, asset allocation)
-- **RESTful API**: Clean, well-documented endpoints
-- **Production Ready**: Comprehensive error handling, logging, and testing
+A small REST API for tracking investment portfolios, written in Go. Gin for
+routing, GORM over PostgreSQL for persistence, HS256 JWTs for authentication.
+It is a portfolio project: deliberately narrow in scope, with the plumbing a
+real service needs done properly.
 
 ## Architecture
 
 ```
-Client Request → Router → Middleware (Auth) → Handler → Database
-   ↓              ↓           ↓              ↓         ↓
-  HTTP     Gin Router   JWT Validation  Business  PostgreSQL
-                                        Logic
+          HTTP                 internal/httpapi                   internal/store
+client ───────▶ gin router ──▶ middleware ──▶ handlers ──▶ store.Store ──▶ GORM ──▶ PostgreSQL
+                              request-id      bind/validate   (interface)   (impl)
+                              slog access log  map errors
+                              recovery         to status codes      ▲
+                              JWT auth                              │ embedded SQL
+                              rate limit (auth)                     │ migrations
+                                     │
+                                     ▼
+                              internal/domain  (User, Portfolio, Asset, Stats; ErrNotFound/ErrConflict)
+                              internal/auth    (bcrypt, JWT issue/verify)
 ```
 
-## Getting Started
+Dependency direction is strictly inward: `httpapi` depends on `store.Store`
+(an interface) and `domain`; `store` depends on `domain`; `domain` depends on
+nothing in the repo. `cmd/server/main.go` wires the concrete pieces together.
 
-### Prerequisites
+## Running it
 
-- Go 1.21+
-- PostgreSQL 12+
-- Docker (optional)
-
-### Local Development
-
-1. **Clone the repository**
-   ```bash
-   git clone https://github.com/striver-21/portfolio-manager.git
-   cd portfolio-manager
-   ```
-
-2. **Set up PostgreSQL database**
-   ```bash
-   # Create database
-   createdb portfolio_manager
-   ```
-
-3. **Configure environment**
-   ```bash
-   export DATABASE_URL="host=localhost user=postgres password=postgres dbname=portfolio_manager port=5432 sslmode=disable"
-   export PORT=8080
-   ```
-
-4. **Install dependencies and run**
-   ```bash
-   go mod download
-   go run .
-   ```
-
-Server will start at `http://localhost:8080`
-
-### Docker Deployment
+### With Docker Compose
 
 ```bash
-docker-compose up -d
+docker compose up --build
 ```
 
-## API Endpoints
+Starts Postgres 16 (with a health check), waits for it, applies migrations
+(`-migrate`) and serves on `http://localhost:8080`. A development `JWT_SECRET`
+is baked into `docker-compose.yml`; override it with
+`JWT_SECRET=... docker compose up`.
 
-### Authentication
-
-- `POST /api/auth/register` - Register a new user
-- `POST /api/auth/login` - Login and get JWT token
-
-### Portfolios
-
-- `POST /api/portfolios` - Create portfolio
-- `GET /api/portfolios` - List all portfolios
-- `GET /api/portfolios/{id}` - Get portfolio details
-- `PUT /api/portfolios/{id}` - Update portfolio
-- `DELETE /api/portfolios/{id}` - Delete portfolio
-- `GET /api/portfolios/{id}/stats` - Get portfolio statistics
-
-### Assets
-
-- `POST /api/portfolios/{portfolio_id}/assets` - Add asset
-- `PUT /api/portfolios/{portfolio_id}/assets/{asset_id}` - Update asset
-- `DELETE /api/portfolios/{portfolio_id}/assets/{asset_id}` - Delete asset
-
-### Health
-
-- `GET /health` - Health check
-
-## Usage Examples
-
-### Register
+### Locally against your own Postgres
 
 ```bash
-curl -X POST http://localhost:8080/api/auth/register \
-  -H "Content-Type: application/json" \
-  -d '{
-    "email": "user@example.com",
-    "password": "securepassword123"
-  }'
+createdb portfolio_manager
+export DATABASE_URL="postgres://postgres:postgres@localhost:5432/portfolio_manager?sslmode=disable"
+export JWT_SECRET="$(openssl rand -base64 48)"
+
+go run ./cmd/server -migrate-only   # apply schema, exit
+go run ./cmd/server                 # serve
 ```
 
-Response:
-```json
-{
-  "id": "550e8400-e29b-41d4-a716-446655440000",
-  "email": "user@example.com"
-}
-```
+### Configuration
 
-### Login
+Everything comes from the environment (see `.env.example`):
+
+| Variable       | Required | Default             | Notes                                      |
+|----------------|----------|---------------------|--------------------------------------------|
+| `DATABASE_URL` | yes      |                     | Postgres DSN (URL or key=value form)       |
+| `JWT_SECRET`   | yes      |                     | HS256 key, at least 32 bytes               |
+| `PORT`         | no       | `8080`              |                                            |
+| `JWT_ISSUER`   | no       | `portfolio-manager` | `iss` claim, checked on verify             |
+| `TOKEN_TTL`    | no       | `24h`               | Go duration                                |
+| `LOG_LEVEL`    | no       | `info`              | `debug`, `info`, `warn`, `error`           |
+| `GIN_MODE`     | no       | `release`           | Read by Gin; forced to release when unset  |
+
+The process refuses to start if `DATABASE_URL` or `JWT_SECRET` is missing, and
+reports every configuration problem in one message.
+
+Flags: `-migrate` applies pending migrations then serves; `-migrate-only`
+applies them and exits.
+
+## API
+
+The full contract is in [`api/openapi.yaml`](api/openapi.yaml). Summary:
+
+| Method | Path                                         | Auth | Notes                                     |
+|--------|----------------------------------------------|------|-------------------------------------------|
+| GET    | `/health`                                    | no   | 200 if the DB answers a ping, else 503    |
+| POST   | `/api/auth/register`                         | no   | 201; 409 on duplicate email; rate limited |
+| POST   | `/api/auth/login`                            | no   | 200 with JWT; 401; rate limited           |
+| GET    | `/api/portfolios?limit=&offset=`             | yes  | Paginated, newest first, no assets        |
+| POST   | `/api/portfolios`                            | yes  | 201                                       |
+| GET    | `/api/portfolios/{id}`                       | yes  | Includes `assets`                         |
+| PUT    | `/api/portfolios/{id}`                       | yes  | Partial; `"description": ""` clears       |
+| DELETE | `/api/portfolios/{id}`                       | yes  | 204; 404 if nothing was deleted           |
+| GET    | `/api/portfolios/{id}/stats`                 | yes  | Exact decimal totals                      |
+| POST   | `/api/portfolios/{id}/assets`                | yes  | 201                                       |
+| PUT    | `/api/portfolios/{id}/assets/{asset_id}`     | yes  | Partial                                   |
+| DELETE | `/api/portfolios/{id}/assets/{asset_id}`     | yes  | 204 / 404                                 |
+
+Errors are always `{"error": "...", "details": [...]}`. A portfolio that
+belongs to someone else is a 404, not a 403, so ids cannot be probed.
+
+### curl walkthrough
 
 ```bash
-curl -X POST http://localhost:8080/api/auth/login \
-  -H "Content-Type: application/json" \
-  -d '{
-    "email": "user@example.com",
-    "password": "securepassword123"
-  }'
+BASE=http://localhost:8080
+
+# 1. Register and log in
+curl -s -X POST $BASE/api/auth/register \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"ada@example.com","password":"correct-horse-battery"}'
+# {"email":"ada@example.com","id":"5d1b..."}
+
+TOKEN=$(curl -s -X POST $BASE/api/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"ada@example.com","password":"correct-horse-battery"}' | jq -r .token)
+
+# 2. Create a portfolio
+PF=$(curl -s -X POST $BASE/api/portfolios \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"name":"Long term","description":"Index funds and a little tech"}' | jq -r .id)
+
+# 3. Add holdings. Amounts are decimal strings (numbers are accepted too).
+curl -s -X POST $BASE/api/portfolios/$PF/assets \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"symbol":"AAPL","quantity":"10","purchase_price":"100","current_price":"150"}'
+curl -s -X POST $BASE/api/portfolios/$PF/assets \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"symbol":"GOOGL","quantity":"5","purchase_price":"200","current_price":"250"}'
+
+# 4. Stats
+curl -s $BASE/api/portfolios/$PF/stats -H "Authorization: Bearer $TOKEN"
+# {"total_value":"2750","total_cost":"2000","total_gain":"750",
+#  "total_gain_percent":"37.5","asset_count":2,
+#  "asset_breakdown":{"AAPL":"1500","GOOGL":"1250"}}
+
+# 5. Clear the description, then list
+curl -s -X PUT $BASE/api/portfolios/$PF \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"description":""}'
+curl -s "$BASE/api/portfolios?limit=10" -H "Authorization: Bearer $TOKEN"
+
+# 6. Delete (204), then confirm it is gone (404)
+curl -s -o /dev/null -w '%{http_code}\n' -X DELETE $BASE/api/portfolios/$PF -H "Authorization: Bearer $TOKEN"
+curl -s -o /dev/null -w '%{http_code}\n' $BASE/api/portfolios/$PF -H "Authorization: Bearer $TOKEN"
 ```
 
-Response:
-```json
-{
-  "token": "eyJhbGciOiJIUzI1NiIs...",
-  "user_id": "550e8400-e29b-41d4-a716-446655440000",
-  "email": "user@example.com"
-}
-```
+## Design notes
 
-### Create Portfolio
+- **Money is decimal.** Quantities and prices are `shopspring/decimal`, stored
+  as `NUMERIC(24,8)`, and rendered as JSON strings. Analytics never touch
+  `float64`. Inputs are validated to fit the column (positive, up to 8 decimal
+  places, below 10^16).
+- **Storage behind an interface.** Handlers only see `store.Store`. The GORM
+  implementation passes `ctx` to every query, translates driver errors to
+  `domain.ErrNotFound` / `domain.ErrConflict`, and checks `RowsAffected` so a
+  delete or update of a missing row is a 404, not a silent 200.
+- **No check-then-insert.** Registration relies on the unique index and maps
+  the unique-violation error to 409, so two concurrent registrations of the
+  same email cannot both succeed or produce a 500.
+- **Explicit SQL migrations**, embedded with `embed` and applied by a small
+  runner (`internal/store/migrate.go`) that records versions in
+  `schema_migrations` and runs each file in a transaction. No `AutoMigrate`
+  for application tables.
+- **JWT hygiene.** Typed claims (`jwt.RegisteredClaims` + `uid`), signing
+  method pinned to HS256 via `jwt.WithValidMethods`, issuer and expiry
+  required, secret must be at least 32 bytes and come from the environment.
+- **Login hardening.** bcrypt (cost 10); unknown emails still pay a bcrypt
+  compare so timing does not reveal account existence; `/api/auth/*` is
+  rate limited per client IP with an in-memory token bucket (10/min, burst 10).
+- **Operational plumbing.** `log/slog` JSON logs with a per-request
+  `X-Request-ID`, `http.Server` timeouts, `signal.NotifyContext` graceful
+  shutdown, Gin in release mode, distroless non-root container.
 
-```bash
-curl -X POST http://localhost:8080/api/portfolios \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer <TOKEN>" \
-  -d '{
-    "name": "My Portfolio",
-    "description": "My investment portfolio"
-  }'
-```
-
-### Add Asset
-
-```bash
-curl -X POST http://localhost:8080/api/portfolios/{portfolio_id}/assets \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer <TOKEN>" \
-  -d '{
-    "symbol": "AAPL",
-    "quantity": 10,
-    "purchase_price": 150.00,
-    "current_price": 175.00
-  }'
-```
-
-### Get Portfolio Stats
-
-```bash
-curl http://localhost:8080/api/portfolios/{portfolio_id}/stats \
-  -H "Authorization: Bearer <TOKEN>"
-```
-
-Response:
-```json
-{
-  "total_value": 4250,
-  "total_cost": 3500,
-  "total_gain": 750,
-  "total_gain_percent": 21.43,
-  "asset_count": 2,
-  "asset_breakdown": {
-    "AAPL": 1500,
-    "GOOGL": 2750
-  }
-}
-```
+Known limits, on purpose: the rate limiter is per process (use the edge or
+Redis across replicas); proxies are not trusted, so behind a load balancer
+`ClientIP()` is the balancer until trusted CIDRs are configured; there is no
+token revocation or refresh.
 
 ## Testing
 
-Run all tests:
 ```bash
-go test -v -race -coverprofile=coverage.out ./...
-go tool cover -html=coverage.out
+go test -race -count=1 -cover ./...
 ```
 
-Run specific test:
-```bash
-go test -v -run TestCreatePortfolio
-```
+The suite needs no Docker and no running database: it uses the pure-Go
+`github.com/glebarez/sqlite` driver with a fresh in-memory database per test,
+migrated by the same runner that migrates Postgres. One test
+(`TestPostgresMigrationsApply`) exercises the real Postgres migrations and is
+skipped unless `TEST_DATABASE_URL` is set; CI provides a Postgres service for it.
 
-## Code Quality
+Measured coverage (`go tool cover -func`, all packages): **77%** of
+statements. `cmd/server/main.go` is the untested part; the packages under
+`internal/` range from 80% (`store`) through 85% (`httpapi`) and 97% (`auth`)
+to 100% (`config`, `domain`, `ratelimit`).
 
-- **Go vet**: Static analysis
-  ```bash
-  go vet ./...
-  ```
+CI (`.github/workflows/ci.yml`) runs build, vet, gofmt, the race-enabled
+tests, golangci-lint and govulncheck.
 
-- **Lint**: Code linting
-  ```bash
-  golangci-lint run
-  ```
-
-- **Tests**: Comprehensive unit tests with 70%+ coverage
-  ```bash
-  go test -v -coverprofile=coverage.out ./...
-  ```
-
-## Project Structure
+## Layout
 
 ```
-portfolio-manager/
-├── main.go              # Application entry point
-├── models.go            # Data models
-├── handlers.go          # HTTP handlers
-├── handlers_test.go     # Handler tests
-├── database.go          # Database operations
-├── auth.go              # Authentication logic
-├── middleware.go        # HTTP middleware
-├── Dockerfile           # Docker configuration
-├── docker-compose.yml   # Docker Compose setup
-├── go.mod               # Go modules
-├── README.md            # This file
-└── .gitignore           # Git ignore rules
+cmd/server/            main: config, wiring, migrations flag, graceful shutdown
+internal/auth/         bcrypt helpers, JWT TokenManager
+internal/config/       environment parsing
+internal/domain/       core types, sentinel errors, stats calculation
+internal/httpapi/      gin router, middleware, handlers, HTTP tests
+internal/ratelimit/    in-memory token bucket
+internal/store/        Store interface, GORM implementation, migration runner,
+                       migrations/{postgres,sqlite}/*.sql, storetest helper
+api/openapi.yaml       OpenAPI 3 description of the API
 ```
-
-## Technologies
-
-- **Go 1.21** - Programming language
-- **Gin Web Framework** - HTTP server
-- **GORM** - ORM for database operations
-- **PostgreSQL** - Relational database
-- **JWT** - Token-based authentication
-- **Testify** - Testing utilities
-- **Docker** - Containerization
-
-## Future Enhancements
-
-- [ ] Integrate real-time stock pricing API
-- [ ] Advanced analytics (Sharpe ratio, volatility analysis)
-- [ ] Portfolio rebalancing recommendations
-- [ ] Transaction history tracking
-- [ ] Export portfolio data to CSV/PDF
-- [ ] Multi-currency support
-- [ ] WebSocket for real-time updates
-
-## Contributing
-
-Contributions are welcome! Please follow these steps:
-
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
 
 ## License
 
-This project is licensed under the MIT License - see the LICENSE file for details.
-
-## Security
-
-⚠️ **Important**: Change the JWT secret key in production!
-
-Update `jwtSecret` in `auth.go` or set via environment variable:
-```bash
-export JWT_SECRET="your-very-secure-secret-key-here"
-```
-
-## Support
-
-For issues or questions, please open an GitHub issue.
-
-## Author
-
-**Sachin Soni** - [@striver-21](https://github.com/striver-21)
+MIT. See [LICENSE](LICENSE).

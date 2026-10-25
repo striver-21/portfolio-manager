@@ -1,0 +1,429 @@
+openapi: 3.0.3
+info:
+  title: Portfolio Manager API
+  version: 0.2.0
+  description: |
+    REST API for tracking investment portfolios and their holdings.
+
+    All monetary amounts and quantities are decimal strings (for example
+    `"150.25"`) in responses. Requests may send them as JSON numbers or
+    strings; strings are recommended to avoid client-side float rounding.
+
+    Every response carries an `X-Request-ID` header; send your own to have it
+    echoed back and attached to server logs.
+servers:
+  - url: http://localhost:8080
+
+tags:
+  - name: auth
+  - name: portfolios
+  - name: assets
+  - name: system
+
+paths:
+  /health:
+    get:
+      tags: [system]
+      summary: Liveness and database reachability
+      security: []
+      responses:
+        "200":
+          description: Service and database are up
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: ok }
+        "503":
+          description: Database unreachable
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: unavailable }
+
+  /api/auth/register:
+    post:
+      tags: [auth]
+      summary: Create an account
+      description: Email is normalised to lower case. Rate limited per client IP.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RegisterRequest" }
+      responses:
+        "201":
+          description: Account created
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [id, email]
+                properties:
+                  id: { type: string, format: uuid }
+                  email: { type: string, format: email }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "409":
+          description: Email already registered
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+
+  /api/auth/login:
+    post:
+      tags: [auth]
+      summary: Exchange credentials for a bearer token
+      description: Rate limited per client IP. Unknown email and wrong password are indistinguishable.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/LoginRequest" }
+      responses:
+        "200":
+          description: Token issued
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/LoginResponse" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401":
+          description: Invalid credentials
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+
+  /api/portfolios:
+    get:
+      tags: [portfolios]
+      summary: List the caller's portfolios
+      description: Newest first. Assets are not included; fetch a portfolio by id for those.
+      parameters:
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 0, default: 20 }
+          description: Page size. Values above 100 are clamped to 100; 0 means default.
+        - name: offset
+          in: query
+          schema: { type: integer, minimum: 0, default: 0 }
+      responses:
+        "200":
+          description: One page of portfolios
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PortfolioPage" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+    post:
+      tags: [portfolios]
+      summary: Create a portfolio
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreatePortfolioRequest" }
+      responses:
+        "201":
+          description: Portfolio created (with an empty assets array)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Portfolio" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /api/portfolios/{id}:
+    parameters:
+      - $ref: "#/components/parameters/PortfolioID"
+    get:
+      tags: [portfolios]
+      summary: Get a portfolio with its assets
+      responses:
+        "200":
+          description: The portfolio
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Portfolio" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    put:
+      tags: [portfolios]
+      summary: Update name and/or description
+      description: |
+        Fields that are absent or null are left unchanged. Sending
+        `"description": ""` clears the description. At least one field is required.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/UpdatePortfolioRequest" }
+      responses:
+        "200":
+          description: Updated portfolio (with assets)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Portfolio" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      tags: [portfolios]
+      summary: Delete a portfolio and all of its assets
+      responses:
+        "204": { description: Deleted }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/portfolios/{id}/stats:
+    parameters:
+      - $ref: "#/components/parameters/PortfolioID"
+    get:
+      tags: [portfolios]
+      summary: Performance summary
+      responses:
+        "200":
+          description: Totals computed with exact decimal arithmetic
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Stats" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/portfolios/{id}/assets:
+    parameters:
+      - $ref: "#/components/parameters/PortfolioID"
+    post:
+      tags: [assets]
+      summary: Add a holding
+      description: Symbol is trimmed and upper-cased. All amounts must be > 0 with at most 8 decimal places.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/AddAssetRequest" }
+      responses:
+        "201":
+          description: Asset created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Asset" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/portfolios/{id}/assets/{asset_id}:
+    parameters:
+      - $ref: "#/components/parameters/PortfolioID"
+      - name: asset_id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    put:
+      tags: [assets]
+      summary: Update quantity and/or prices
+      description: Absent or null fields are left unchanged. At least one field is required.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/UpdateAssetRequest" }
+      responses:
+        "200":
+          description: Updated asset
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Asset" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      tags: [assets]
+      summary: Remove a holding
+      responses:
+        "204": { description: Deleted }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+security:
+  - bearerAuth: []
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+    PortfolioID:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+
+  responses:
+    BadRequest:
+      description: Malformed body, failed validation or bad query parameter
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example:
+            error: validation failed
+            details: ["quantity: must be greater than 0"]
+    Unauthorized:
+      description: Missing, malformed, expired or forged token
+      headers:
+        WWW-Authenticate:
+          schema: { type: string }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    NotFound:
+      description: The resource does not exist or belongs to another user
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    TooManyRequests:
+      description: Auth endpoint rate limit exceeded for this client IP
+      headers:
+        Retry-After:
+          schema: { type: string, example: "60" }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+
+  schemas:
+    Decimal:
+      description: Arbitrary-precision decimal rendered as a string.
+      type: string
+      pattern: '^-?\d+(\.\d+)?$'
+      example: "150.25"
+    DecimalInput:
+      description: Decimal accepted as a string (preferred) or a JSON number.
+      oneOf:
+        - type: string
+          pattern: '^-?\d+(\.\d+)?$'
+        - type: number
+      example: "150.25"
+
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error: { type: string }
+        details:
+          type: array
+          items: { type: string }
+
+    RegisterRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email: { type: string, format: email, maxLength: 254 }
+        password: { type: string, minLength: 8, maxLength: 72 }
+
+    LoginRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email: { type: string, format: email }
+        password: { type: string, maxLength: 72 }
+
+    LoginResponse:
+      type: object
+      required: [token, user_id, email]
+      properties:
+        token: { type: string, description: JWT (HS256), valid for TOKEN_TTL }
+        user_id: { type: string, format: uuid }
+        email: { type: string, format: email }
+
+    CreatePortfolioRequest:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 100 }
+        description: { type: string, maxLength: 1000 }
+
+    UpdatePortfolioRequest:
+      type: object
+      minProperties: 1
+      properties:
+        name: { type: string, minLength: 1, maxLength: 100, nullable: true }
+        description: { type: string, maxLength: 1000, nullable: true }
+
+    Portfolio:
+      type: object
+      required: [id, user_id, name, description, created_at, updated_at]
+      properties:
+        id: { type: string, format: uuid }
+        user_id: { type: string, format: uuid }
+        name: { type: string }
+        description: { type: string }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        assets:
+          type: array
+          description: Present on single-portfolio responses, absent on list responses.
+          items: { $ref: "#/components/schemas/Asset" }
+
+    PortfolioPage:
+      type: object
+      required: [items, total, limit, offset]
+      properties:
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/Portfolio" }
+        total: { type: integer, format: int64 }
+        limit: { type: integer }
+        offset: { type: integer }
+
+    AddAssetRequest:
+      type: object
+      required: [symbol, quantity, purchase_price, current_price]
+      properties:
+        symbol: { type: string, minLength: 1, maxLength: 32 }
+        quantity: { $ref: "#/components/schemas/DecimalInput" }
+        purchase_price: { $ref: "#/components/schemas/DecimalInput" }
+        current_price: { $ref: "#/components/schemas/DecimalInput" }
+
+    UpdateAssetRequest:
+      type: object
+      minProperties: 1
+      properties:
+        quantity: { $ref: "#/components/schemas/DecimalInput" }
+        purchase_price: { $ref: "#/components/schemas/DecimalInput" }
+        current_price: { $ref: "#/components/schemas/DecimalInput" }
+
+    Asset:
+      type: object
+      required: [id, portfolio_id, symbol, quantity, purchase_price, current_price, created_at, updated_at]
+      properties:
+        id: { type: string, format: uuid }
+        portfolio_id: { type: string, format: uuid }
+        symbol: { type: string }
+        quantity: { $ref: "#/components/schemas/Decimal" }
+        purchase_price: { $ref: "#/components/schemas/Decimal" }
+        current_price: { $ref: "#/components/schemas/Decimal" }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    Stats:
+      type: object
+      required: [total_value, total_cost, total_gain, total_gain_percent, asset_count, asset_breakdown]
+      properties:
+        total_value: { $ref: "#/components/schemas/Decimal" }
+        total_cost: { $ref: "#/components/schemas/Decimal" }
+        total_gain: { $ref: "#/components/schemas/Decimal" }
+        total_gain_percent:
+          allOf: [{ $ref: "#/components/schemas/Decimal" }]
+          description: Rounded to 4 decimal places; 0 when total_cost is 0.
+        asset_count: { type: integer }
+        asset_breakdown:
+          type: object
+          description: Current value per symbol; duplicate symbols are summed.
+          additionalProperties: { $ref: "#/components/schemas/Decimal" }

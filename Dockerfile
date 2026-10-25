@@ -1,35 +1,18 @@
-# Build stage
-FROM golang:1.21-alpine AS builder
+# syntax=docker/dockerfile:1
 
-WORKDIR /app
+FROM golang:1.26-alpine AS builder
+WORKDIR /src
 
-# Install git for go mod download
-RUN apk add --no-cache git
-
-# Copy go mod files
 COPY go.mod go.sum ./
+RUN --mount=type=cache,target=/go/pkg/mod go mod download
 
-# Download dependencies
-RUN go mod download
-
-# Copy source code
 COPY . .
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/server ./cmd/server
 
-# Build the application
-RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o portfolio-manager .
-
-# Final stage
-FROM alpine:latest
-
-RUN apk --no-cache add ca-certificates
-
-WORKDIR /root/
-
-# Copy the binary from builder
-COPY --from=builder /app/portfolio-manager .
-
-# Expose port
+FROM gcr.io/distroless/static-debian12:nonroot
+COPY --from=builder /out/server /server
 EXPOSE 8080
-
-# Run the application
-CMD ["./portfolio-manager"]
+USER nonroot:nonroot
+ENTRYPOINT ["/server"]
